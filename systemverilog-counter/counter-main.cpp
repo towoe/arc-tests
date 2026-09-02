@@ -1,7 +1,7 @@
 #include "counter-arc.h"
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <string>
 
 // A 10ns clock period. The runtime keeps time in femtoseconds.
 static constexpr uint64_t halfPeriodFs = 5'000'000;
