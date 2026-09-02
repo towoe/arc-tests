@@ -1,72 +1,89 @@
-REPO_ROOT := ..
+# Arcilator Makefile for SystemVerilog counter
+#
+#   circt-verilog -> core dialect IR
+#   arcilator -> LLVM IR
+#   cxx -> executable
+#
+# Dependencies:
+# - uv
+
+MODEL     ?= counter
+TOP       ?= Counter
+TRACE     ?= 0
+BUILD_DIR ?= build
+
 ARCILATOR_UTILS_ROOT ?= $(dir $(shell which arcilator))
+CIRCT_INCLUDE_DIR    ?= $(ARCILATOR_UTILS_ROOT)/../../include
+CIRCT_LIB_DIR        ?= $(ARCILATOR_UTILS_ROOT)/../lib
 
-ARCRUNTIME ?= 0
-ARCRUNTIME_INCLUDE_DIR   ?= $(ARCILATOR_UTILS_ROOT)/../../include
-ARCRUNTIME_CIRCT_LIB_DIR ?= $(ARCILATOR_UTILS_ROOT)/../lib
-ARCRUNTIME_LLVM_LIB_DIR  ?= $(dir $(shell which llc))/../lib
-ARCRUNTIME_LINK_LIBS     := -lCIRCTArcRuntime -lLLVMSupport -lLLVMDemangle
+PYTHON ?= uv run --quiet --with jinja2 python3
 
-CXXFLAGS = -O3 -Wall -std=c++17
-LDFLAGS =
-ifeq ($(shell uname), Linux)
-	CXXFLAGS += -no-pie
-	LDFLAGS += -latomic
-endif
-
-BUILD_DIR ?= build/$(CONFIG)
-$(shell mkdir -p $(BUILD_DIR))
-
-SOURCE_MODEL ?= counter
-BUILD_MODEL ?= $(BUILD_DIR)/counter
-
-ARCILATOR_ARGS ?= --mlir-timing --print-debug-info --mlir-pass-statistics --async-resets-as-sync
+CXXFLAGS ?= -O2 -Wall -std=c++17
+CXXFLAGS += -I$(ARCILATOR_UTILS_ROOT) -I$(BUILD_DIR)
+CXXFLAGS += -DARC_USE_COMPILED_RUNTIME_LIB -I$(CIRCT_INCLUDE_DIR)
+LDFLAGS  ?=
+LDFLAGS  += -L$(CIRCT_LIB_DIR) -lCIRCTArcRuntime -Wl,-rpath,$(CIRCT_LIB_DIR)
 
 ifeq ($(TRACE),1)
-	ARCILATOR_ARGS += --observe-wires --observe-ports --observe-named-values --observe-registers --observe-memories
-	VERILATOR_ARGS += --trace --trace-underscore
-	CXXFLAGS += -DTRACE
-else
-	ARCILATOR_ARGS += --observe-wires=0 --observe-ports=0 --observe-named-values=0 --observe-registers=0 --observe-memories=0
+  # --trace-taps adds the instrumentation that feeds observed values to the
+  # runtime; the --observe-* flags decide which values those are.
+  ARCILATOR_ARGS += --trace-taps
+  ARCILATOR_ARGS += --observe-wires --observe-ports --observe-named-values --observe-registers --observe-memories
 endif
 
-ifeq ($(ARCRUNTIME),1)
-    ARCRUNTIME_CXXFLAGS  = -DARC_USE_COMPILED_RUNTIME_LIB
-    ARCRUNTIME_CXXFLAGS += -I$(ARCRUNTIME_INCLUDE_DIR)
-    ARCRUNTIME_LD_FLAGS  = -L$(ARCRUNTIME_CIRCT_LIB_DIR)
-    ARCRUNTIME_LD_FLAGS += -L$(ARCRUNTIME_LLVM_LIB_DIR)
-    ARCRUNTIME_LD_FLAGS += $(ARCRUNTIME_LINK_LIBS)
-endif
+BIN := $(BUILD_DIR)/$(MODEL)-main
+
+all: $(BIN)
+
+$(BUILD_DIR):
+	mkdir -p $@
 
 #===------------------------------------------------------------------------===
 # SystemVerilog to core dialect IR
 #===------------------------------------------------------------------------===
 
-$(BUILD_DIR)/$(SOURCE_MODEL).mlir: $(SOURCE_MODEL).sv | $(BUILD_DIR)
+$(BUILD_DIR)/$(MODEL).mlir: $(MODEL).sv | $(BUILD_DIR)
 	circt-verilog --ir-hw --top $(TOP) $< -o $@
 
-#===-------------------------------------------------------------------------===
+#===------------------------------------------------------------------------===
 # Arcilator
-#===-------------------------------------------------------------------------===
+#===------------------------------------------------------------------------===
 
-$(BUILD_MODEL)-arc.o $(BUILD_MODEL).json &: $(BUILD_MODEL).mlir
-	arcilator $< --state-file=$(BUILD_MODEL).json -o $(BUILD_MODEL)-arc.ll $(ARCILATOR_ARGS)
-	opt -O3 -S $(BUILD_MODEL)-arc.ll | llc -O3 --filetype=obj -o $(BUILD_MODEL)-arc.o
-	objdump -d $(BUILD_MODEL)-arc.o > $(BUILD_MODEL)-arc.s
+$(BUILD_DIR)/$(MODEL)-arc.o $(BUILD_DIR)/$(MODEL).json &: $(BUILD_DIR)/$(MODEL).mlir
+	arcilator $< --state-file=$(BUILD_DIR)/$(MODEL).json $(ARCILATOR_ARGS) -o $(BUILD_DIR)/$(MODEL)-arc.ll
+	llc -O3 --filetype=obj $(BUILD_DIR)/$(MODEL)-arc.ll -o $(BUILD_DIR)/$(MODEL)-arc.o
 
-$(BUILD_MODEL)-arc.h: $(BUILD_MODEL).json
-	python3 $(ARCILATOR_UTILS_ROOT)/arcilator-header-cpp.py $< --view-depth 1 > $@
+$(BUILD_DIR)/$(MODEL)-arc.h: $(BUILD_DIR)/$(MODEL).json
+	$(PYTHON) $(ARCILATOR_UTILS_ROOT)/arcilator-header-cpp.py $< --view-depth 1 > $@
 
-#===-------------------------------------------------------------------------===
+#===------------------------------------------------------------------------===
+# Testbench
+#===------------------------------------------------------------------------===
+
+$(BIN): $(MODEL)-main.cpp $(BUILD_DIR)/$(MODEL)-arc.h $(BUILD_DIR)/$(MODEL)-arc.o
+	$(CXX) $(CXXFLAGS) $< $(BUILD_DIR)/$(MODEL)-arc.o -o $@ $(LDFLAGS)
+
+#===------------------------------------------------------------------------===
 # Convenience
-#===-------------------------------------------------------------------------===
+#===------------------------------------------------------------------------===
 
-run: $(BUILD_MODEL)-main
-	$(BUILD_MODEL)-main $(BINARY) $(RUN_ARGS)
+ir-hw: $(BUILD_DIR)/$(MODEL).mlir
 
-run-arcs: RUN_ARGS += --arcs
-run-arcs: run
-run-trace: RUN_ARGS += --trace $(BUILD_MODEL).vcd
-run-trace: run
+arc: $(BUILD_DIR)/$(MODEL)-arc.o $(BUILD_DIR)/$(MODEL)-arc.h
 
-.PHONY: all run run-arcs run-trace clean
+run: $(BIN)
+	$(BIN) $(RUN_ARGS)
+
+# Tracing needs --trace-taps at build time, so re-enter with TRACE=1.
+trace:
+	$(MAKE) TRACE=1 RUN_ARGS='--trace $(MODEL).vcd' run
+
+# Show which symbols the model exports and needs.
+symbols: $(BUILD_DIR)/$(MODEL)-arc.o
+	@echo "== defined =="; nm -g $< | grep -v ' U '
+	@echo "== undefined =="; nm -gu $<
+
+clean:
+	rm -rf $(BUILD_DIR) $(MODEL).vcd
+
+.PHONY: all ir-hw arc run trace symbols clean
